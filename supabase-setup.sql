@@ -218,3 +218,49 @@ create policy rental_app_snapshots_owner_manager_write on public.rental_app_snap
 create index if not exists idx_rental_tasks_due on public.rental_tasks ((record_data->>'dueDate'));
 create index if not exists idx_rental_attendance_owner on public.rental_attendance (record_owner);
 create index if not exists idx_media_files_record on public.media_files (record_type, record_id);
+
+-- Production hardening 2: typed reporting views over JSONB record tables.
+-- These do not replace the app's JSONB compatibility layer, but they make reporting/search safer and easier.
+create or replace view public.v_rental_customers as
+select
+  record_id,
+  record_owner,
+  updated_at,
+  record_data->>'name' as name,
+  record_data->>'mobile' as mobile,
+  record_data->>'type' as party_type,
+  record_data->>'city' as city,
+  nullif(record_data->>'openingBalance','')::numeric as opening_balance
+from public.rental_customers;
+
+create or replace view public.v_rental_articles as
+select
+  record_id,
+  record_owner,
+  updated_at,
+  record_data->>'articleName' as article_name,
+  record_data->>'articleCode' as article_code,
+  record_data->>'articleType' as article_type,
+  record_data->>'status' as status,
+  nullif(record_data->>'qtyTotal','')::numeric as qty_total,
+  nullif(record_data->>'replacementCost','')::numeric as replacement_cost
+from public.rental_articles;
+
+create or replace view public.v_rental_invoices as
+select
+  record_id,
+  record_owner,
+  updated_at,
+  record_data->>'invoiceNo' as invoice_no,
+  record_data->>'customerName' as customer_name,
+  record_data->>'mobile' as mobile,
+  record_data->>'status' as status,
+  nullif(record_data->>'invoiceDate','')::date as invoice_date,
+  nullif(record_data->>'dueDate','')::date as due_date,
+  coalesce(nullif(record_data->>'deliveryCharge','')::numeric,0) as delivery_charge,
+  coalesce(nullif(record_data->>'pickupCharge','')::numeric,0) as pickup_charge
+from public.rental_invoices;
+
+grant select on public.v_rental_customers to authenticated;
+grant select on public.v_rental_articles to authenticated;
+grant select on public.v_rental_invoices to authenticated;

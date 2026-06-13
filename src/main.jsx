@@ -2,8 +2,9 @@ import React, { useEffect, useMemo, useState } from 'react';
 import { createRoot } from 'react-dom/client';
 import { createClient } from '@supabase/supabase-js';
 import './styles.css';
-
-const STORAGE_KEY = 'urban-rental-services-os-v2-clean';
+import { APP_VERSION, STORAGE_KEY } from './lib/appMeta.js';
+import { assertValidSupabaseSettings, escapeHtml, getAuthRedirectUrl, isValidSupabasePublicKey, isValidSupabaseUrl } from './lib/security.js';
+import { canIssueQuantity, shouldLockPaidInvoice } from './lib/businessRules.js';
 
 const CHECKLISTS = {
   toolBefore: [
@@ -446,7 +447,7 @@ function businessHealthScore(store) {
 function printDocument(title, html) {
   const win = window.open('', '_blank');
   if (!win) return;
-  win.document.write(`<!doctype html><html><head><title>${title}</title><style>body{font-family:Arial,sans-serif;margin:28px;color:#111}h1,h2{margin:0 0 8px}.meta{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin:18px 0}table{width:100%;border-collapse:collapse;margin:16px 0}th,td{border:1px solid #ddd;padding:8px;text-align:left}th{background:#f5f5f5}.right{text-align:right}.terms{white-space:pre-line;margin-top:18px}.totals{margin-left:auto;width:320px}.muted{color:#666;font-size:12px}@media print{button{display:none}}</style></head><body>${html}<button onclick="window.print()">Print / Save PDF</button></body></html>`);
+  win.document.write(`<!doctype html><html><head><title>${escapeHtml(title)}</title><style>body{font-family:Arial,sans-serif;margin:28px;color:#111}h1,h2{margin:0 0 8px}.meta{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin:18px 0}table{width:100%;border-collapse:collapse;margin:16px 0}th,td{border:1px solid #ddd;padding:8px;text-align:left}th{background:#f5f5f5}.right{text-align:right}.terms{white-space:pre-line;margin-top:18px}.totals{margin-left:auto;width:320px}.muted{color:#666;font-size:12px}@media print{button{display:none}}</style></head><body>${html}<button onclick="window.print()">Print / Save PDF</button></body></html>`);
   win.document.close();
 }
 
@@ -477,7 +478,7 @@ function defaultSettings() {
     driveClientId: '',
     driveFolderName: 'Rental Services OS',
     driveAutoUploadFiles: true,
-    driveLocalFallback: true,
+    driveLocalFallback: false,
     driveBackupName: 'rental-services-backups',
     supabaseEnabled: true,
     supabaseUrl: '',
@@ -487,13 +488,14 @@ function defaultSettings() {
     supabaseDataMode: 'relational',
     supabaseRelationalEnabled: true,
     supabaseAutoSyncData: true,
-    supabaseLocalFallback: true,
+    supabaseLocalFallback: false,
     roleMode: 'Owner',
     advancedMode: true,
     approvalRequiredAbove: 5000,
     latePenaltyPerDay: 100,
     lowStockWarningQty: 1,
-    salaryRules: defaultSalaryRules()
+    salaryRules: defaultSalaryRules(),
+    localCacheBusinessData: false
   };
 }
 
@@ -621,7 +623,8 @@ function sanitizeFolderName(value = 'folder') {
 function getSupabaseClient(settings = {}) {
   const url = settings.supabaseUrl?.trim();
   const anonKey = settings.supabaseAnonKey?.trim();
-  if (!url || !anonKey) throw new Error('Enter Supabase URL and anon public key first');
+  if (!isValidSupabaseUrl(url)) throw new Error('Enter a valid Supabase Project URL like https://xxxx.supabase.co');
+  if (!isValidSupabasePublicKey(anonKey)) throw new Error('Enter a valid Supabase publishable/anon public key. Do not use service_role or database password.');
   return createClient(url, anonKey);
 }
 
@@ -1263,11 +1266,25 @@ function normalizeStore(parsed = {}) {
   };
 }
 
+function safeLocalStoreSnapshot(store = {}) {
+  const normalized = normalizeStore(store);
+  const clean = emptyStore();
+  return {
+    ...clean,
+    settings: normalizeSettings(normalized.settings),
+    audit: (normalized.audit || []).slice(0, 50),
+    localCacheNotice: 'Business records are stored in Supabase. Browser cache stores settings only unless localCacheBusinessData is enabled.',
+    appVersion: APP_VERSION
+  };
+}
+
 function loadStore() {
   try {
     const raw = localStorage.getItem(STORAGE_KEY);
     if (!raw) return emptyStore();
-    return normalizeStore(JSON.parse(raw));
+    const parsed = normalizeStore(JSON.parse(raw));
+    if (parsed.settings?.localCacheBusinessData === true) return parsed;
+    return safeLocalStoreSnapshot(parsed);
   } catch {
     return emptyStore();
   }
@@ -1625,21 +1642,39 @@ function LoginScreen({ settings, authState, onSaveConnection, onLogin, onSignUp 
     mode: 'login',
     claimOwner: false
   });
-  const configured = Boolean(form.supabaseUrl && form.supabaseAnonKey);
-  const update = (key, value) => setForm((prev) => ({ ...prev, [key]: value }));
+  const [connectionNotice, setConnectionNotice] = useState('');
+  const cleanSupabaseUrl = form.supabaseUrl.trim();
+  const cleanSupabaseKey = form.supabaseAnonKey.trim();
+  const urlOk = isValidSupabaseUrl(cleanSupabaseUrl);
+  const keyOk = isValidSupabasePublicKey(cleanSupabaseKey);
+  const configured = Boolean(urlOk && keyOk);
+  const update = (key, value) => {
+    setConnectionNotice('');
+    setForm((prev) => ({ ...prev, [key]: value }));
+  };
 
   function saveConnection(e) {
     e.preventDefault();
-    onSaveConnection({ supabaseUrl: form.supabaseUrl.trim(), supabaseAnonKey: form.supabaseAnonKey.trim() });
+    if (!configured) {
+      setConnectionNotice('Enter a valid Supabase Project URL and publishable/anon public key.');
+      return;
+    }
+    onSaveConnection({ supabaseUrl: cleanSupabaseUrl, supabaseAnonKey: cleanSupabaseKey });
+    setConnectionNotice('Supabase connection saved. Now create/login your user.');
   }
 
   function submitAuth(e) {
     e.preventDefault();
-    onSaveConnection({ supabaseUrl: form.supabaseUrl.trim(), supabaseAnonKey: form.supabaseAnonKey.trim() });
+    if (!configured) {
+      setConnectionNotice('Save a valid Supabase connection before login/signup.');
+      return;
+    }
+    onSaveConnection({ supabaseUrl: cleanSupabaseUrl, supabaseAnonKey: cleanSupabaseKey });
+    const authConnection = { supabaseUrl: cleanSupabaseUrl, supabaseAnonKey: cleanSupabaseKey };
     if (form.mode === 'signup') {
-      onSignUp({ email: form.email.trim(), password: form.password, fullName: form.fullName.trim(), claimOwner: form.claimOwner, settings: { supabaseUrl: form.supabaseUrl.trim(), supabaseAnonKey: form.supabaseAnonKey.trim() } });
+      onSignUp({ email: form.email.trim(), password: form.password, fullName: form.fullName.trim(), claimOwner: form.claimOwner, settings: authConnection });
     } else {
-      onLogin({ email: form.email.trim(), password: form.password, settings: { supabaseUrl: form.supabaseUrl.trim(), supabaseAnonKey: form.supabaseAnonKey.trim() } });
+      onLogin({ email: form.email.trim(), password: form.password, settings: authConnection });
     }
   }
 
@@ -1650,10 +1685,11 @@ function LoginScreen({ settings, authState, onSaveConnection, onLogin, onSignUp 
         <div className="auth-grid">
           <form className="auth-panel" onSubmit={saveConnection}>
             <h2>1. Supabase Connection</h2>
-            <p className="muted">Run <code>supabase-setup.sql</code>, then paste your Project URL and anon public key. Business data is saved in Supabase.</p>
+            <p className="muted">Run <code>supabase-setup.sql</code>, then paste your Project URL and Supabase publishable/anon public key. Business data is saved in Supabase.</p>
             <Field label="Supabase Project URL" required><input value={form.supabaseUrl} onChange={(e) => update('supabaseUrl', e.target.value)} placeholder="https://xxxx.supabase.co" /></Field>
-            <Field label="Supabase Anon Public Key" required><input value={form.supabaseAnonKey} onChange={(e) => update('supabaseAnonKey', e.target.value)} placeholder="eyJhbGciOi..." /></Field>
-            <button type="submit">Save Supabase Connection</button>
+            <Field label="Supabase Publishable / Anon Public Key" required><input value={form.supabaseAnonKey} onChange={(e) => update('supabaseAnonKey', e.target.value)} placeholder="sb_publishable_... or eyJhbGciOi..." /></Field>
+            {connectionNotice && <div className={configured ? "alert alert-green" : "alert alert-red"}>{connectionNotice}</div>}
+            <button type="submit" className="primary" disabled={!configured}>Save Supabase Connection</button>
           </form>
           <form className="auth-panel" onSubmit={submitAuth}>
             <h2>2. Role Based Login</h2>
@@ -1693,7 +1729,8 @@ function App() {
   const [authState, setAuthState] = useState({ loading: true, session: null, user: null, profile: null, error: '', notice: '' });
 
   useEffect(() => {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(store));
+    const cachePayload = store.settings?.localCacheBusinessData === true ? store : safeLocalStoreSnapshot(store);
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(cachePayload));
   }, [store]);
 
   useEffect(() => {
@@ -1721,7 +1758,7 @@ function App() {
     client.auth.getSession().then(({ data }) => {
       if (!mounted) return;
       if (data?.session) {
-        completeAuthSession(client, data.session).catch((error) => setAuthState((a) => ({ ...a, loading: false, error: error.message || 'Session load failed' })));
+        completeAuthSession(client, data.session, { settingsOverride: settings }).catch((error) => setAuthState((a) => ({ ...a, loading: false, error: error.message || 'Session load failed' })));
       } else {
         setAuthState((a) => ({ ...a, loading: false, session: null, user: null, profile: null }));
       }
@@ -1732,7 +1769,7 @@ function App() {
         setAuthState((a) => ({ ...a, loading: false, session: null, user: null, profile: null }));
         return;
       }
-      completeAuthSession(client, session).catch((error) => setAuthState((a) => ({ ...a, loading: false, error: error.message || 'Auth state failed' })));
+      completeAuthSession(client, session, { settingsOverride: settings }).catch((error) => setAuthState((a) => ({ ...a, loading: false, error: error.message || 'Auth state failed' })));
     });
     subscription = authListener?.data?.subscription;
     return () => { mounted = false; subscription?.unsubscribe?.(); };
@@ -1766,7 +1803,7 @@ function App() {
     setSupabaseState((d) => ({ ...d, client, connected: true, status: `Logged in as ${profile.role}`, syncing: false }));
     setAuthState({ loading: false, session, user: session.user, profile, error: '', notice: '' });
     setStore((prev) => applyRoleToStoreSettings(prev, profile));
-    const settings = normalizeSettings(store.settings);
+    const settings = normalizeSettings({ ...store.settings, ...(options.settingsOverride || {}) });
     if (settings.supabaseAutoSyncData && !options.skipLoad) {
       try {
         const remote = await loadStoreFromSupabase({ client, settings });
@@ -1782,13 +1819,14 @@ function App() {
 
   async function handleLogin({ email, password, settings: authSettings = {} }) {
     try {
+      if (!email || !password) throw new Error('Enter email and password');
       setAuthState((a) => ({ ...a, loading: true, error: '', notice: '' }));
       const loginSettings = normalizeSettings({ ...store.settings, ...authSettings, supabaseEnabled: true });
       const client = getSupabaseClient(loginSettings);
       saveConnectionSettings(authSettings);
       const { data, error } = await client.auth.signInWithPassword({ email, password });
       if (error) throw error;
-      await completeAuthSession(client, data.session);
+      await completeAuthSession(client, data.session, { settingsOverride: loginSettings });
       notify('Logged in with Supabase');
     } catch (error) {
       setAuthState((a) => ({ ...a, loading: false, error: error.message || 'Login failed' }));
@@ -1797,15 +1835,24 @@ function App() {
 
   async function handleSignUp({ email, password, fullName, claimOwner, settings: authSettings = {} }) {
     try {
+      if (!email || !/^\S+@\S+\.\S+$/.test(email)) throw new Error('Enter a valid email address');
+      if (!password || password.length < 6) throw new Error('Password must be at least 6 characters');
       setAuthState((a) => ({ ...a, loading: true, error: '', notice: '' }));
       const signupSettings = normalizeSettings({ ...store.settings, ...authSettings, supabaseEnabled: true });
       const client = getSupabaseClient(signupSettings);
       saveConnectionSettings(authSettings);
-      const { data, error } = await client.auth.signUp({ email, password, options: { data: { full_name: fullName } } });
+      const { data, error } = await client.auth.signUp({
+        email,
+        password,
+        options: {
+          data: { full_name: fullName },
+          emailRedirectTo: getAuthRedirectUrl()
+        }
+      });
       if (error) throw error;
       if (data.session) {
         if (claimOwner) await client.rpc('claim_first_owner', { p_full_name: fullName || email }).catch(() => null);
-        await completeAuthSession(client, data.session, { skipLoad: true });
+        await completeAuthSession(client, data.session, { skipLoad: true, settingsOverride: signupSettings });
         notify(claimOwner ? 'Owner account created' : 'Staff account created');
       } else {
         setAuthState((a) => ({ ...a, loading: false, notice: 'Account created. Check email confirmation, then log in.' }));
@@ -2842,27 +2889,22 @@ function IssueArticle({ store, saveStore, notify, articleAvailableQty, drive }) 
 
   function printSlip(rental) {
     const article = store.articles.find((a) => a.id === rental.articleId);
+    const accessories = (rental.accessoriesIssued || []).filter((x) => x.issued).map((x) => `• ${escapeHtml(x.name)}`).join('<br/>') || '-';
     const html = `
-      <html><head><title>${rental.issueNo}</title><style>body{font-family:Arial;padding:24px}h1{margin:0 0 6px}.box{border:1px solid #222;padding:14px;margin:12px 0}.grid{display:grid;grid-template-columns:1fr 1fr;gap:8px}small{color:#555}</style></head>
-      <body>
-        <h1>Rental Issue Slip</h1><small>${rental.issueNo}</small>
-        <div class="box"><b>Article:</b> ${article?.articleName || rental.articleSnapshot}<br/><b>Code:</b> ${article?.articleCode || '-'}<br/><b>Qty:</b> ${rental.quantity}</div>
-        <div class="grid"><div><b>Issued To:</b> ${rental.customerName}</div><div><b>Mobile:</b> ${rental.mobile}</div><div><b>Site:</b> ${rental.siteName}</div><div><b>Type:</b> ${rental.customerType}</div><div><b>Issue Date:</b> ${fmtDate(rental.issueDate)}</div><div><b>Return Date:</b> ${fmtDate(rental.expectedReturnDate)}</div><div><b>Rent:</b> ${money(rental.rentRate)} / ${rental.rentUnit}</div><div><b>Deposit:</b> ${money(rental.deposit)}</div></div>
-        <div class="box"><b>Accessories:</b><br/>${rental.accessoriesIssued.filter(x => x.issued).map(x => `• ${x.name}`).join('<br/>') || '-'}</div>
+        <h1>Rental Issue Slip</h1><small>${escapeHtml(rental.issueNo)}</small>
+        <div class="box"><b>Article:</b> ${escapeHtml(article?.articleName || rental.articleSnapshot)}<br/><b>Code:</b> ${escapeHtml(article?.articleCode || '-')}<br/><b>Qty:</b> ${escapeHtml(rental.quantity)}</div>
+        <div class="grid"><div><b>Issued To:</b> ${escapeHtml(rental.customerName)}</div><div><b>Mobile:</b> ${escapeHtml(rental.mobile)}</div><div><b>Site:</b> ${escapeHtml(rental.siteName)}</div><div><b>Type:</b> ${escapeHtml(rental.customerType)}</div><div><b>Issue Date:</b> ${escapeHtml(fmtDate(rental.issueDate))}</div><div><b>Return Date:</b> ${escapeHtml(fmtDate(rental.expectedReturnDate))}</div><div><b>Rent:</b> ${money(rental.rentRate)} / ${escapeHtml(rental.rentUnit)}</div><div><b>Deposit:</b> ${money(rental.deposit)}</div></div>
+        <div class="box"><b>Accessories:</b><br/>${accessories}</div>
         <div class="box"><b>Terms:</b><br/>Late return, damage, missing accessory, or lost article will be charged from deposit or payable balance. Article must be returned in the same condition.</div>
-        <p>Customer Signature: ____________________ &nbsp;&nbsp; Received By: ____________________</p>
-      </body></html>`;
-    const win = window.open('', '_blank');
-    win.document.write(html);
-    win.document.close();
-    win.print();
+        <p>Customer Signature: ____________________ &nbsp;&nbsp; Received By: ____________________</p>`;
+    printDocument(`Issue Slip ${rental.issueNo}`, `<style>.box{border:1px solid #222;padding:14px;margin:12px 0}.grid{display:grid;grid-template-columns:1fr 1fr;gap:8px}</style>${html}`);
   }
 
   function submit(e) {
     e.preventDefault();
     if (!selected) return notify('Select article');
-    if (toNumber(form.quantity) <= 0) return notify('Quantity must be greater than zero');
-    if (toNumber(form.quantity) > available) return notify(`Only ${available} available`);
+    const issueCheck = canIssueQuantity({ requestedQty: form.quantity, availableQty: available });
+    if (!issueCheck.ok) return notify(issueCheck.reason);
     if (!form.customerName || !form.mobile || !form.siteName) return notify('Customer name, mobile and site are required');
     if (!form.expectedReturnDate) return notify('Expected return date is required');
     if (!form.termsAccepted) return notify('Terms must be accepted before issue');
@@ -3496,11 +3538,11 @@ function CustomerMaster({ store, saveStore, notify, onOpen360 }) {
 
 function documentRowsHtml(items = []) {
   const rows = computeDocTotals(items).items;
-  return rows.map((it, idx) => `<tr><td>${idx + 1}</td><td>${it.articleName || it.description || '-'}</td><td>${it.lineType || 'Rental'}</td><td class="right">${it.qty}</td><td class="right">${it.duration} ${it.rentUnit || ''}</td><td class="right">${money(it.rate)}</td><td class="right">${money(it.discount)}</td><td class="right">${it.taxPercent || 0}%</td><td class="right">${money(it.lineTotal)}</td></tr>`).join('');
+  return rows.map((it, idx) => `<tr><td>${idx + 1}</td><td>${escapeHtml(it.articleName || it.description || '-')}</td><td>${escapeHtml(it.lineType || 'Rental')}</td><td class="right">${escapeHtml(it.qty)}</td><td class="right">${escapeHtml(it.duration)} ${escapeHtml(it.rentUnit || '')}</td><td class="right">${money(it.rate)}</td><td class="right">${money(it.discount)}</td><td class="right">${escapeHtml(it.taxPercent || 0)}%</td><td class="right">${money(it.lineTotal)}</td></tr>`).join('');
 }
 
 function buildPrintHtml({ title, number, firmName, doc, totals }) {
-  return `<h1>${firmName || 'Rental Services OS'}</h1><h2>${title}: ${number}</h2><div class="meta"><div><b>Party:</b> ${doc.customerName || '-'}<br/><b>Mobile:</b> ${doc.mobile || '-'}<br/><b>Site:</b> ${doc.siteName || '-'}</div><div><b>Date:</b> ${fmtDate(doc.quoteDate || doc.invoiceDate)}<br/><b>Valid/Due:</b> ${fmtDate(doc.validTill || doc.dueDate)}<br/><b>Status:</b> ${doc.status || '-'}</div></div><table><thead><tr><th>#</th><th>Item</th><th>Type</th><th class="right">Qty</th><th class="right">Duration</th><th class="right">Rate</th><th class="right">Discount</th><th class="right">GST</th><th class="right">Amount</th></tr></thead><tbody>${documentRowsHtml(doc.items || [])}</tbody></table><table class="totals"><tr><td>Subtotal</td><td class="right">${money(totals.subtotal)}</td></tr><tr><td>GST/Tax</td><td class="right">${money(totals.taxTotal)}</td></tr><tr><td>Delivery</td><td class="right">${money(totals.delivery)}</td></tr><tr><td>Pickup</td><td class="right">${money(totals.pickup)}</td></tr><tr><td>Round Off</td><td class="right">${money(totals.roundOff)}</td></tr><tr><th>Total</th><th class="right">${money(totals.grandTotal)}</th></tr><tr><td>Refundable Deposit</td><td class="right">${money(totals.depositTotal)}</td></tr><tr><th>Total with Deposit</th><th class="right">${money(totals.payableWithDeposit)}</th></tr></table><div class="terms"><b>Terms:</b><br/>${doc.terms || 'Damage, missing parts and late return are chargeable. Deposit is refundable after inspection.'}</div><p class="muted">Generated from Rental Services OS.</p>`;
+  return `<h1>${escapeHtml(firmName || 'Rental Services OS')}</h1><h2>${escapeHtml(title)}: ${escapeHtml(number)}</h2><div class="meta"><div><b>Party:</b> ${escapeHtml(doc.customerName || '-')}<br/><b>Mobile:</b> ${escapeHtml(doc.mobile || '-')}<br/><b>Site:</b> ${escapeHtml(doc.siteName || '-')}</div><div><b>Date:</b> ${escapeHtml(fmtDate(doc.quoteDate || doc.invoiceDate))}<br/><b>Valid/Due:</b> ${escapeHtml(fmtDate(doc.validTill || doc.dueDate))}<br/><b>Status:</b> ${escapeHtml(doc.status || '-')}</div></div><table><thead><tr><th>#</th><th>Item</th><th>Type</th><th class="right">Qty</th><th class="right">Duration</th><th class="right">Rate</th><th class="right">Discount</th><th class="right">GST</th><th class="right">Amount</th></tr></thead><tbody>${documentRowsHtml(doc.items || [])}</tbody></table><table class="totals"><tr><td>Subtotal</td><td class="right">${money(totals.subtotal)}</td></tr><tr><td>GST/Tax</td><td class="right">${money(totals.taxTotal)}</td></tr><tr><td>Delivery</td><td class="right">${money(totals.delivery)}</td></tr><tr><td>Pickup</td><td class="right">${money(totals.pickup)}</td></tr><tr><td>Round Off</td><td class="right">${money(totals.roundOff)}</td></tr><tr><th>Total</th><th class="right">${money(totals.grandTotal)}</th></tr><tr><td>Refundable Deposit</td><td class="right">${money(totals.depositTotal)}</td></tr><tr><th>Total with Deposit</th><th class="right">${money(totals.payableWithDeposit)}</th></tr></table><div class="terms"><b>Terms:</b><br/>${escapeHtml(doc.terms || 'Damage, missing parts and late return are chargeable. Deposit is refundable after inspection.')}</div><p class="muted">Generated from Rental Services OS.</p>`;
 }
 
 function defaultQuoteForm(settings = {}) {
@@ -3557,20 +3599,31 @@ function QuotationBuilder({ store, saveStore, notify, articleAvailableQty, setTa
     setTab?.('invoices');
   }
   function convertToIssue(q) {
+    const blocked = [];
     saveStore((prev) => {
       let rentals = [...(prev.rentals || [])];
       for (const item of q.items || []) {
         if (item.lineType !== 'Rental' || !item.articleId) continue;
         const article = prev.articles.find((a) => a.id === item.articleId);
         if (!article) continue;
+        const requestedQty = Math.max(1, toNumber(item.qty));
+        const currentlyOut = rentals
+          .filter((r) => r.articleId === article.id && !rentalClosed(r))
+          .reduce((sum, r) => sum + Math.max(0, toNumber(r.quantity) - toNumber(r.quantityReturned)), 0);
+        const availableNow = Math.max(0, toNumber(article.qtyTotal) - currentlyOut);
+        const issueCheck = canIssueQuantity({ requestedQty, availableQty: availableNow });
+        if (!issueCheck.ok) {
+          blocked.push(`${article.articleName}: ${issueCheck.reason}`);
+          continue;
+        }
         rentals = [{
-          id: uid('REN'), issueNo: nextNumber(prev.settings?.receiptPrefix || 'ISS', rentals, 'issueNo'), quoteId: q.id, articleId: article.id, articleSnapshot: article.articleName, quantity: Math.max(1, toNumber(item.qty)), quantityReturned: 0,
+          id: uid('REN'), issueNo: nextNumber(prev.settings?.receiptPrefix || 'ISS', rentals, 'issueNo'), quoteId: q.id, articleId: article.id, articleSnapshot: article.articleName, quantity: requestedQty, quantityReturned: 0,
           customerType: q.customerType || 'Client', customerName: q.customerName, mobile: q.mobile, alternateMobile: '', address: '', siteName: q.siteName, linkedClient: q.customerName, purpose: `Issued from quotation ${q.quoteNo}`, issueDate: q.expectedStartDate || todayISO(), expectedReturnDate: addDaysISO(q.expectedStartDate || todayISO(), toNumber(item.duration)), rentRate: toNumber(item.rate), rentUnit: item.rentUnit || article.rentUnit || 'Day', deposit: toNumber(item.deposit), advancePaid: 0, deliveryCharge: toNumber(q.deliveryCharge), paymentMode: 'Credit', issuedBy: 'Owner', idProof: null, beforePhotos: [], conditionBefore: article.condition || 'Good', checklist: Object.fromEntries((article.articleType === 'Interior Sample / Catalogue' ? CHECKLISTS.sampleBefore : CHECKLISTS.toolBefore).map((x) => [x, false])), accessoriesIssued: (article.accessories || []).map((x) => ({ name: x, issued: true, returned: false })), termsAccepted: false, notes: `Auto-created from ${q.quoteNo}. Complete proof/checklist during physical handover.`, status: 'Active', createdAt: new Date().toISOString()
         }, ...rentals];
       }
-      return { ...prev, rentals, quotations: (prev.quotations || []).map((x) => x.id === q.id ? { ...x, status: 'Issued' } : x) };
+      return { ...prev, rentals, quotations: (prev.quotations || []).map((x) => x.id === q.id ? { ...x, status: blocked.length ? 'Part Issued' : 'Issued', issueBlockedNotes: blocked.join('; ') } : x) };
     });
-    notify('Rental issue records created from quotation');
+    notify(blocked.length ? `Issued available items. Blocked: ${blocked.join('; ')}` : 'Rental issue records created from quotation');
     setTab?.('active');
   }
   function printQuote(q = form) { const t = computeDocTotals(q.items || [], q); printDocument(`Quotation ${q.quoteNo || ''}`, buildPrintHtml({ title: 'Quotation / Estimate', number: q.quoteNo || 'Draft', firmName: store.settings.firmName, doc: q, totals: t })); }
@@ -3631,6 +3684,11 @@ function InvoiceBilling({ store, saveStore, notify }) {
   function submit(e) {
     e.preventDefault();
     if (!form.customerName || !form.mobile) return notify('Customer name and mobile are required');
+    const existing = editingId ? (store.invoices || []).find((inv) => inv.id === editingId) : null;
+    if (existing && shouldLockPaidInvoice(existing, store.payments || [])) {
+      notify('Paid/part-paid invoices are locked. Create a reversal/adjustment entry instead of editing the bill.');
+      return;
+    }
     saveStore((prev) => {
       const invoiceNo = form.invoiceNo || nextNumber(prev.settings?.invoicePrefix || 'INV', prev.invoices || [], 'invoiceNo');
       const record = { ...form, invoiceNo, items: totals.items, updatedAt: new Date().toISOString() };
@@ -3639,7 +3697,11 @@ function InvoiceBilling({ store, saveStore, notify }) {
     });
     setForm(defaultInvoiceForm(store.settings)); setEditingId(''); notify(editingId ? 'Invoice updated' : 'Invoice saved');
   }
-  function edit(inv) { setEditingId(inv.id); setForm({ ...defaultInvoiceForm(store.settings), ...inv, items: inv.items?.length ? inv.items : defaultInvoiceForm(store.settings).items }); }
+  function edit(inv) {
+    if (shouldLockPaidInvoice(inv, store.payments || [])) return notify('This invoice has payment history and is locked. Use reversal/adjustment instead of editing.');
+    setEditingId(inv.id);
+    setForm({ ...defaultInvoiceForm(store.settings), ...inv, items: inv.items?.length ? inv.items : defaultInvoiceForm(store.settings).items });
+  }
   function recordPayment(e) {
     e.preventDefault();
     const inv = (store.invoices || []).find((x) => x.id === pay.invoiceId);
@@ -4003,19 +4065,24 @@ function SalaryPayrollModule({ store, saveStore, notify, currentUser, isOwner })
     if (!canManage) return notify('Only Owner can generate payroll');
     const rows = staffList.map((staff) => computeStaffPayroll(store, staff, month));
     const run = { id: uid('PAY'), month, status: 'Draft', generatedAt: new Date().toISOString(), generatedBy: currentUser?.full_name || currentUser?.email || 'Owner', rows, totals: { staff: rows.length, netSalary: rows.reduce((s, r) => s + toNumber(r.netSalary), 0), deductions: rows.reduce((s, r) => s + toNumber(r.totalDeductions), 0), weeklyOffBonus: rows.reduce((s, r) => s + toNumber(r.weeklyOffBonus), 0) } };
-    saveStore((prev) => ({ ...prev, payrollRuns: [run, ...(prev.payrollRuns || [])], expenses: [{ id: uid('EXP'), date: todayISO(), category: 'Staff Salary', description: `Payroll ${month}`, amount: run.totals.netSalary, paymentMode: 'Bank', createdAt: new Date().toISOString() }, ...(prev.expenses || [])] }), `Owner generated payroll for ${month}`, 'Salary');
+    saveStore((prev) => ({ ...prev, payrollRuns: [run, ...(prev.payrollRuns || [])], expenses: [{ id: uid('EXP'), date: todayISO(), category: 'Staff Salary', description: `Payroll ${month}`, amount: run.totals.netSalary, paymentMode: 'Bank', linkedPayrollRunId: run.id, status: 'Active', createdAt: new Date().toISOString() }, ...(prev.expenses || [])] }), `Owner generated payroll for ${month}`, 'Salary');
     notify('Payroll generated and salary expense added');
   }
 
-  function deletePayrollRun(runId) {
+  function voidPayrollRun(runId) {
     if (!canManage) return;
-    if (!confirm('Delete this payroll run? Salary expense entry will not be auto-deleted.')) return;
-    saveStore((prev) => ({ ...prev, payrollRuns: (prev.payrollRuns || []).filter((run) => run.id !== runId) }), 'Owner deleted payroll run', 'Salary');
-    notify('Payroll run deleted');
+    const reason = prompt('Reason for voiding this payroll run?');
+    if (!reason) return;
+    saveStore((prev) => ({
+      ...prev,
+      payrollRuns: (prev.payrollRuns || []).map((run) => run.id === runId ? { ...run, status: 'Void', voidedAt: new Date().toISOString(), voidReason: reason } : run),
+      expenses: (prev.expenses || []).map((expense) => expense.linkedPayrollRunId === runId ? { ...expense, status: 'Void', voidedAt: new Date().toISOString(), voidReason: reason } : expense)
+    }), 'Owner voided payroll run', 'Salary');
+    notify('Payroll run voided; audit history preserved');
   }
 
   function printPayslip(row) {
-    const html = `<h1>Salary Slip</h1><p class="muted">${store.settings?.firmName || 'Rental Services OS'} · ${month}</p><div class="meta"><div><b>Staff</b><br>${row.staffName}</div><div><b>Role</b><br>${row.role}</div><div><b>Present Days</b><br>${row.presentDays}</div><div><b>Weekly Off Worked</b><br>${row.weeklyOffWorked}/${row.weeklyOffCount}</div></div><table><tr><th>Component</th><th class="right">Amount</th></tr><tr><td>Base Salary</td><td class="right">${money(row.baseSalary)}</td></tr><tr><td>Allowance</td><td class="right">${money(row.allowance)}</td></tr><tr><td>Weekly-off Bonus</td><td class="right">${money(row.weeklyOffBonus)}</td></tr><tr><td>Approved Leave Deduction (${row.approvedLeaveDays} days)</td><td class="right">-${money(row.approvedDeduction)}</td></tr><tr><td>Unapproved Leave / Absentee Deduction (${row.unapprovedLeaveDays} days)</td><td class="right">-${money(row.unapprovedDeduction + row.absenteePenalty)}</td></tr><tr><td>Manual Deduction</td><td class="right">-${money(row.manualDeduction)}</td></tr><tr><th>Net Salary</th><th class="right">${money(row.netSalary)}</th></tr></table>`;
+    const html = `<h1>Salary Slip</h1><p class="muted">${escapeHtml(store.settings?.firmName || 'Rental Services OS')} · ${escapeHtml(month)}</p><div class="meta"><div><b>Staff</b><br>${escapeHtml(row.staffName)}</div><div><b>Role</b><br>${escapeHtml(row.role)}</div><div><b>Present Days</b><br>${row.presentDays}</div><div><b>Weekly Off Worked</b><br>${row.weeklyOffWorked}/${row.weeklyOffCount}</div></div><table><tr><th>Component</th><th class="right">Amount</th></tr><tr><td>Base Salary</td><td class="right">${money(row.baseSalary)}</td></tr><tr><td>Allowance</td><td class="right">${money(row.allowance)}</td></tr><tr><td>Weekly-off Bonus</td><td class="right">${money(row.weeklyOffBonus)}</td></tr><tr><td>Approved Leave Deduction (${row.approvedLeaveDays} days)</td><td class="right">-${money(row.approvedDeduction)}</td></tr><tr><td>Unapproved Leave / Absentee Deduction (${row.unapprovedLeaveDays} days)</td><td class="right">-${money(row.unapprovedDeduction + row.absenteePenalty)}</td></tr><tr><td>Manual Deduction</td><td class="right">-${money(row.manualDeduction)}</td></tr><tr><th>Net Salary</th><th class="right">${money(row.netSalary)}</th></tr></table>`;
     printDocument(`Payslip ${row.staffName} ${month}`, html);
   }
 
@@ -4075,7 +4142,7 @@ function SalaryPayrollModule({ store, saveStore, notify, currentUser, isOwner })
       </Section>
 
       <Section title="Saved Payroll Runs" subtitle="Owner-generated payroll snapshots. Salary expense is added to accounting when generated.">
-        <div className="table-wrap"><table><thead><tr><th>Month</th><th>Generated</th><th>Staff</th><th>Net Salary</th><th>Deductions</th><th>Weekly Bonus</th><th>Action</th></tr></thead><tbody>{savedRuns.map((run) => <tr key={run.id}><td>{run.month}</td><td>{new Date(run.generatedAt).toLocaleString('en-IN')}</td><td>{run.totals?.staff || run.rows?.length || 0}</td><td>{money(run.totals?.netSalary)}</td><td>{money(run.totals?.deductions)}</td><td>{money(run.totals?.weeklyOffBonus)}</td><td>{canManage ? <button className="danger ghost" onClick={() => deletePayrollRun(run.id)}>Delete</button> : <span className="muted">Owner only</span>}</td></tr>)}</tbody></table>{savedRuns.length === 0 && <Empty text="No payroll run generated for this month." />}</div>
+        <div className="table-wrap"><table><thead><tr><th>Month</th><th>Generated</th><th>Staff</th><th>Net Salary</th><th>Deductions</th><th>Weekly Bonus</th><th>Action</th></tr></thead><tbody>{savedRuns.map((run) => <tr key={run.id}><td>{run.month}</td><td>{new Date(run.generatedAt).toLocaleString('en-IN')}</td><td>{run.totals?.staff || run.rows?.length || 0}</td><td>{money(run.totals?.netSalary)}</td><td>{money(run.totals?.deductions)}</td><td>{money(run.totals?.weeklyOffBonus)}</td><td>{canManage ? <button className="danger ghost" onClick={() => voidPayrollRun(run.id)}>Void</button> : <span className="muted">Owner only</span>}</td></tr>)}</tbody></table>{savedRuns.length === 0 && <Empty text="No payroll run generated for this month." />}</div>
       </Section>
     </div>
   );
@@ -4352,6 +4419,7 @@ function SettingsPanel({ store, saveStore, notify, driveState, connectDrive, upl
           <div className="wide divider-title">Supabase Auth + Database</div>
           <label className="terms"><input type="checkbox" checked={Boolean(form.supabaseEnabled)} onChange={(e) => update('supabaseEnabled', e.target.checked)} /> <span>Enable Supabase login + database</span></label>
           <label className="terms"><input type="checkbox" checked={Boolean(form.supabaseAutoSyncData)} onChange={(e) => update('supabaseAutoSyncData', e.target.checked)} /> <span>Auto-save business data to Supabase</span></label>
+          <label className="terms"><input type="checkbox" checked={Boolean(form.localCacheBusinessData)} onChange={(e) => update('localCacheBusinessData', e.target.checked)} /> <span>Emergency only: cache business records in this browser. Keep OFF for shared/mobile devices.</span></label>
           <Field label="Supabase Project URL"><input value={form.supabaseUrl} onChange={(e) => update('supabaseUrl', e.target.value)} placeholder="https://xxxx.supabase.co" /></Field>
           <Field label="Supabase Anon Public Key"><input value={form.supabaseAnonKey} onChange={(e) => update('supabaseAnonKey', e.target.value)} placeholder="eyJhbGciOi..." /></Field>
           <Field label="Data Storage Mode"><select value={form.supabaseDataMode || 'relational'} onChange={(e) => update('supabaseDataMode', e.target.value)}><option value="relational">Relational tables with RLS</option><option value="snapshot">Legacy JSON snapshot fallback</option></select></Field>
@@ -4363,7 +4431,7 @@ function SettingsPanel({ store, saveStore, notify, driveState, connectDrive, upl
           <div className="wide divider-title">Google Drive Media Storage</div>
           <label className="terms"><input type="checkbox" checked={Boolean(form.driveEnabled)} onChange={(e) => update('driveEnabled', e.target.checked)} /> <span>Enable Google Drive for media files</span></label>
           <label className="terms"><input type="checkbox" checked={Boolean(form.driveAutoUploadFiles)} onChange={(e) => update('driveAutoUploadFiles', e.target.checked)} /> <span>Auto-upload photos, videos, bills, proofs and catalogues to Drive</span></label>
-          <label className="terms"><input type="checkbox" checked={Boolean(form.driveLocalFallback)} onChange={(e) => update('driveLocalFallback', e.target.checked)} /> <span>If Drive upload fails, save file locally in browser</span></label>
+          <label className="terms"><input type="checkbox" checked={Boolean(form.driveLocalFallback)} onChange={(e) => update('driveLocalFallback', e.target.checked)} /> <span>Emergency only: if Drive upload fails, save file locally in this browser</span></label>
           <Field label="Google OAuth Web Client ID"><input value={form.driveClientId} onChange={(e) => update('driveClientId', e.target.value)} placeholder="1234567890-xxxx.apps.googleusercontent.com" /></Field>
           <Field label="Main Drive Folder"><input value={form.driveFolderName} onChange={(e) => update('driveFolderName', e.target.value)} placeholder="Rental Services OS" /></Field>
           <Field label="Backup Subfolder"><input value={form.driveBackupName} onChange={(e) => update('driveBackupName', e.target.value)} placeholder="rental-services-backups" /></Field>

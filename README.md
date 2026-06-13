@@ -337,3 +337,49 @@ This build implements the previous bug-hunt checklist except item 6 automated re
 - Global user-facing errors are surfaced through toast/notice messages instead of silent failures in the main flows.
 
 Automated Playwright/Cypress/Vitest tests were intentionally not added because they were excluded by request.
+
+## Vercel + Supabase auth redirect note
+
+The app now passes the current deployed origin as `emailRedirectTo` during Supabase sign-up. This prevents confirmation emails from redirecting to `localhost` when the app is deployed on Vercel, as long as the same Vercel URL is also allowed in Supabase Auth URL Configuration.
+
+Use a Supabase Project URL like `https://xxxxx.supabase.co` and a public browser key starting with either `sb_publishable_` or the legacy `eyJ...` anon key format. Never use the `service_role` or secret key in this app.
+
+## 2026-06-13 Production Fix Notes
+
+This package includes the production-fix pass requested after deployment testing:
+
+- Supabase signup now uses the live app origin for email confirmation redirects (`emailRedirectTo: window.location.origin`).
+- Supabase connection validation accepts both `sb_publishable_...` keys and legacy JWT anon keys.
+- Supabase client creation now blocks invalid project URLs, service-role-like mistakes, and empty keys earlier with clearer messages.
+- Local browser caching now stores settings only by default. Business records should live in Supabase. A separate emergency toggle can cache business records locally if needed.
+- Supabase JSON snapshot fallback and Drive local-file fallback are OFF by default for safer production behaviour.
+- Print/PDF HTML output now escapes user-entered document fields before writing to the print window.
+- Vite config has been updated to remove the deprecated `inlineDynamicImports` build option.
+
+Recommended Supabase URL settings:
+
+- Site URL: your Vercel app URL
+- Redirect URL: `https://your-vercel-app.vercel.app/**`
+
+Run `supabase-setup.sql` before creating users.
+
+## Production Hardening 2
+
+This package includes safer deployment defaults and additional production guards:
+
+- pinned dependency versions
+- CI workflow
+- automated Node tests
+- split Vite production chunks
+- Supabase/Vercel auth redirect helper
+- paid invoice edit lock
+- rental over-issue guard
+- payroll void instead of delete
+- typed Supabase reporting views
+
+Run locally or in Codespaces:
+
+```bash
+npm ci
+npm run check
+```
